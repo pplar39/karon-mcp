@@ -2,6 +2,7 @@
 """Karon API MCP Server."""
 from karon_mcp import __version__
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 import httpx
 import os
 import json
@@ -15,6 +16,9 @@ import unicodedata
 from urllib.parse import urlparse, urldefrag
 
 logger = logging.getLogger("karon-mcp")
+logging.getLogger("mcp").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 mcp = FastMCP("karon-mcp")
 mcp._mcp_server.version = __version__
@@ -35,7 +39,7 @@ _MAX_REJECTED = 100
 _global_sem = asyncio.Semaphore(_MAX_CONCURRENCY)
 _client: httpx.AsyncClient | None = None
 
-# --- Blocked networks (SSRF defense) ---
+# --- Network access validation ---
 _BLOCKED_NETS = [
     # IPv4
     ipaddress.ip_network("0.0.0.0/8"),
@@ -46,15 +50,15 @@ _BLOCKED_NETS = [
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.0.0.0/24"),
     ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("224.0.0.0/4"),       # #20 multicast
-    ipaddress.ip_network("240.0.0.0/4"),       # #20 reserved
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
     ipaddress.ip_network("255.255.255.255/32"),  # broadcast
     # IPv6
     ipaddress.ip_network("::/128"),
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
-    ipaddress.ip_network("fec0::/10"),          # #55 site-local
+    ipaddress.ip_network("fec0::/10"),
     ipaddress.ip_network("2001:db8::/32"),      # documentation
     ipaddress.ip_network("::ffff:0:0/96"),      # IPv4-mapped
     ipaddress.ip_network("64:ff9b::/96"),       # NAT64
@@ -63,13 +67,13 @@ _BLOCKED_NETS = [
 # --- Control character translation table (built once) ---
 _CONTROL_TRANSLATION: dict[int, str] = {}
 for _i in range(32):
-    if _i not in (9, 10, 13):  # #6: preserve TAB, LF, CR
+    if _i not in (9, 10, 13):
         _CONTROL_TRANSLATION[_i] = f"\\x{_i:02x}"
-_CONTROL_TRANSLATION[0x7F] = "\\x7f"  # #32: DEL
-for _i in range(0x80, 0xA0):           # #48: C1 control codes
+_CONTROL_TRANSLATION[0x7F] = "\\x7f"
+for _i in range(0x80, 0xA0):
     _CONTROL_TRANSLATION[_i] = f"\\x{_i:02x}"
 for _cp in (0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
-            0x2066, 0x2067, 0x2068, 0x2069):  # #32: bidi overrides
+            0x2066, 0x2067, 0x2068, 0x2069):
     _CONTROL_TRANSLATION[_cp] = ""
 
 _SENSITIVE_RE = re.compile(
@@ -113,7 +117,7 @@ async def _get_client() -> httpx.AsyncClient:
             follow_redirects=False,
             trust_env=False,
             limits=httpx.Limits(max_connections=_MAX_CONCURRENCY),
-            cookies=httpx.Cookies(),         # #24: isolated empty jar
+            cookies=httpx.Cookies(),
         )
     return _client
 
@@ -125,13 +129,10 @@ def _is_blocked_ip(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         if addr.ipv4_mapped:                 # ::ffff:x.x.x.x
             check_addrs.append(addr.ipv4_mapped)
         packed = addr.packed
-        # #53: IPv4-compatible ::x.x.x.x (not :: or ::1)
         if packed[:12] == b"\x00" * 12 and packed[12:] not in (b"\x00\x00\x00\x00", b"\x00\x00\x00\x01"):
             check_addrs.append(ipaddress.IPv4Address(packed[12:]))
-        # #52: 6to4 — 2002:AABB:CCDD::/48 embeds IPv4 A.B.C.D
         if packed[:2] == b"\x20\x02":
             check_addrs.append(ipaddress.IPv4Address(packed[2:6]))
-        # #52: Teredo — 2001:0000:...: client IP is packed[12:16] XOR 0xFFFFFFFF
         if packed[:4] == b"\x20\x01\x00\x00":
             client_bits = int.from_bytes(packed[12:16], "big") ^ 0xFFFFFFFF
             check_addrs.append(ipaddress.IPv4Address(client_bits))
@@ -147,15 +148,15 @@ async def _validate_url(url: str) -> str | None:
     if not isinstance(url, str) or not url.strip():
         return "url must be a non-empty string"
 
-    url = url.strip()  # #9
+    url = url.strip()
 
-    if "\x00" in url:  # #54: null byte rejection
+    if "\x00" in url:
         return "url contains null byte"
 
     if len(url) > _MAX_URL_LEN:
         return f"url exceeds {_MAX_URL_LEN} chars"
 
-    try:  # #8: urlparse can raise ValueError
+    try:
         parsed = urlparse(url)
     except ValueError:
         return "url is malformed"
@@ -166,29 +167,21 @@ async def _validate_url(url: str) -> str | None:
     hostname = parsed.hostname
     if not hostname:
         return "url has no hostname"
-
-    # #21: port validation
     try:
         port = parsed.port
         if port is not None and not (1 <= port <= 65535):
             return "url has invalid port number"
     except ValueError:
         return "url has invalid port number"
-
-    # #41: reject credentials in URL
     if parsed.username or parsed.password:
         return "url must not contain credentials"
-
-    # #25: NFKC normalization (fullwidth chars → ASCII)
     try:
         hostname_lower = unicodedata.normalize("NFKC", hostname.lower())
-    except (UnicodeError, ValueError):  # #13: oversized hostname → UnicodeError
+    except (UnicodeError, ValueError):
         return "url hostname contains invalid characters"
 
     if hostname_lower in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
         return "url target is not allowed"
-
-    # #46: strip IPv6 scope ID (%eth0)
     addr_str = hostname_lower
     if "%" in addr_str:
         addr_str = addr_str.split("%")[0]
@@ -199,9 +192,6 @@ async def _validate_url(url: str) -> str | None:
             return "url target is not allowed"
     except ValueError:
         pass  # Not an IP literal — proceed to DNS check
-
-    # #5: non-blocking DNS resolution via executor
-    # #1: FAIL-CLOSED on DNS failure (was fail-open!)
     loop = asyncio.get_running_loop()
     try:
         infos = await loop.run_in_executor(
@@ -216,26 +206,26 @@ async def _validate_url(url: str) -> str | None:
             except ValueError:
                 continue
     except socket.gaierror:
-        return "url hostname could not be resolved"  # #1 P0: fail-closed
+        return "url hostname could not be resolved"
 
     return None
 
 
 def _safe_str(val: object, *, max_len: int = 0) -> str:
     """Sanitize value for safe output. max_len=0 means no limit."""
-    if isinstance(val, (dict, list)):       # #10: JSON, not Python repr
+    if isinstance(val, (dict, list)):
         try:
             s = json.dumps(val, ensure_ascii=False, allow_nan=False)
         except (ValueError, TypeError):
             s = repr(val)
     elif isinstance(val, str):
         s = val
-    elif val is None:                        # #36: None → ""
+    elif val is None:
         return ""
     else:
         s = str(val)
     s = s.translate(_CONTROL_TRANSLATION)
-    if max_len and len(s) > max_len:         # #28: truncation support
+    if max_len and len(s) > max_len:
         s = s[:max_len] + "\n[truncated]"
     return s
 
@@ -261,13 +251,20 @@ def _parse_response(data: object) -> dict | None:
     return data
 
 
-def _build_error(msg: str, status_code: int | None = None, cost: object = None) -> str:
+def _tool_text(text: str, *, is_error: bool = False) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        isError=is_error,
+    )
+
+
+def _build_error(msg: str, status_code: int | None = None, cost: object = None) -> CallToolResult:
     parts = [f"Error: {_redact_sensitive(_safe_str(msg, max_len=1024))}"]
     if status_code is not None:
         parts.append(f"(HTTP {status_code})")
     if cost is not None:
         parts.append(f"[credits_used: {cost}]")
-    return " ".join(parts)
+    return _tool_text(" ".join(parts), is_error=True)
 
 
 def _sanitize_cost(cost: object) -> object:
@@ -303,7 +300,7 @@ async def _stream_body(
     headers: dict,
     json_body: dict | None = None,
 ) -> tuple[bytes, int]:
-    """#4: Stream response body with size guard. Returns (body, status_code)."""
+    """Stream response body with a size guard."""
     stream_kwargs = {"headers": headers}
     if json_body is not None:
         stream_kwargs["json"] = json_body
@@ -320,7 +317,7 @@ async def _stream_body(
 
 
 async def _parse_json(raw: bytes) -> object:
-    """#47: Offload JSON parsing for large payloads."""
+    """Parse response JSON, offloading large payloads."""
     if len(raw) > 1_000_000:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, json.loads, raw)
@@ -388,7 +385,7 @@ async def _api_json_request(
             headers=headers,
             json_body=json_body,
         )
-        client.cookies.clear()  # #24
+        client.cookies.clear()
     except httpx.HTTPError as e:
         _log_failure("API request failed for %s %s", method, path, exc=e)
         return None, _build_error(_sanitize_exception(e), status_code=status_code), status_code
@@ -470,12 +467,12 @@ def _add_optional(payload: dict, **values: object) -> dict:
 
 # ── MCP tools ────────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def browse(
     url: str,
     extract: str = "markdown",
     readability: bool = True,
-) -> str:
+):
     """
     Fetch a single URL through the Karon API.
     Returns clean text or markdown. Costs 1 credit (cache) or 10 credits (fresh retrieval).
@@ -493,10 +490,10 @@ async def browse(
     if url_err:
         return _build_error(url_err)
 
-    if not isinstance(extract, str):  # #50: type guard before set membership
+    if not isinstance(extract, str):
         return _build_error("extract must be a string")
     if extract not in _ALLOWED_EXTRACTS:
-        return _build_error(f"extract must be one of {sorted(_ALLOWED_EXTRACTS)}")  # #33
+        return _build_error(f"extract must be one of {sorted(_ALLOWED_EXTRACTS)}")
 
     if not isinstance(readability, bool):
         return _build_error("readability must be a boolean")
@@ -510,8 +507,8 @@ async def browse(
                 headers={"Authorization": f"Bearer {api_key}"},
                 json_body={"url": url, "extract": extract, "readability": readability},
             )
-            client.cookies.clear()  # #24
-        except httpx.HTTPError as e:  # #12: network vs other
+            client.cookies.clear()
+        except httpx.HTTPError as e:
             _log_failure("browse network request failed", exc=e)
             return _build_error(_sanitize_exception(e))
         except ValueError as e:
@@ -519,20 +516,20 @@ async def browse(
             return _build_error(str(e), status_code=status_code)
         except Exception as e:
             _log_failure("browse request failed", exc=e)
-            return _build_error(_sanitize_exception(e))  # #22
+            return _build_error(_sanitize_exception(e))
 
     try:
         data = await _parse_json(raw)
     except Exception:
-        logger.error("browse JSON parse failed (HTTP %s)", status_code)  # #12
-        return _build_error("JSON parse failed", status_code=status_code)  # #22: no raw exc
+        logger.error("browse JSON parse failed (HTTP %s)", status_code)
+        return _build_error("JSON parse failed", status_code=status_code)
 
     data = _parse_response(data)
     if data is None:
         return _build_error("unexpected response format", status_code=status_code)
 
     success = data.get("success")
-    cost = _sanitize_cost(data.get("cost_credits"))  # #15
+    cost = _sanitize_cost(data.get("cost_credits"))
 
     if success is not True:
         upstream_error = _safe_str(data.get("error", "unknown"), max_len=512)
@@ -543,13 +540,13 @@ async def browse(
             cost=cost,
         )
 
-    if status_code is not None and status_code >= 400:  # #17: keep strict check
+    if status_code is not None and status_code >= 400:
         return _build_error("HTTP error with success flag", status_code=status_code, cost=cost)
 
     raw_content = data.get("content")
-    content = _safe_str(raw_content, max_len=_MAX_CONTENT_LEN) if raw_content is not None else ""  # #36
+    content = _safe_str(raw_content, max_len=_MAX_CONTENT_LEN) if raw_content is not None else ""
 
-    resolved_url = _validate_resolved_url(data.get("url"), url)  # #42, #16
+    resolved_url = _validate_resolved_url(data.get("url"), url)
     timing = data.get("timing")
     cache_hit = timing.get("cache_hit", "?") if isinstance(timing, dict) else "?"
 
@@ -559,7 +556,7 @@ async def browse(
             "credits_used": cost,
             "cache_hit": cache_hit,
             "content": content,
-        }, ensure_ascii=False, allow_nan=False)  # #15
+        }, ensure_ascii=False, allow_nan=False)
 
     lines = [
         f"[source]: {resolved_url}",
@@ -571,13 +568,13 @@ async def browse(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def crawl(
     urls: list[str],
     extract: str = "markdown",
     readability: bool = True,
     concurrency: int = 3,
-) -> str:
+):
     """
     Fetch multiple URLs concurrently. Returns JSON array of results.
 
@@ -589,65 +586,52 @@ async def crawl(
     """
     api_key = _get_api_key()
     if not api_key:
-        return json.dumps([{"url": "N/A", "success": False, "error": "KARON_API_KEY environment variable not set"}])
+        return _build_error("KARON_API_KEY environment variable not set")
 
     if not isinstance(urls, list):
-        return json.dumps([{"url": "N/A", "success": False, "error": "urls must be a list of strings"}])
-
-    # #38: bool is subclass of int — reject explicitly
+        return _build_error("urls must be a list of strings")
     if not isinstance(concurrency, int) or isinstance(concurrency, bool):
-        return json.dumps([{"url": "N/A", "success": False, "error": "concurrency must be an integer"}])
+        return _build_error("concurrency must be an integer")
 
-    if not isinstance(extract, str):  # #50
-        return json.dumps([{"url": "N/A", "success": False, "error": "extract must be a string"}])
+    if not isinstance(extract, str):
+        return _build_error("extract must be a string")
     if extract not in _ALLOWED_EXTRACTS:
-        return json.dumps([{"url": "N/A", "success": False, "error": f"extract must be one of {sorted(_ALLOWED_EXTRACTS)}"}])
+        return _build_error(f"extract must be one of {sorted(_ALLOWED_EXTRACTS)}")
 
     if not isinstance(readability, bool):
-        return json.dumps([{"url": "N/A", "success": False, "error": "readability must be a boolean"}])
-
-    # #18: check count limit BEFORE validation (avoid wasted DNS)
+        return _build_error("readability must be a boolean")
     if len(urls) > _MAX_URLS:
-        return json.dumps([{
-            "url": "N/A", "success": False,
-            "error": f"too many URLs: {len(urls)} (max {_MAX_URLS})",
-        }])
+        return _build_error(f"too many URLs: {len(urls)} (max {_MAX_URLS})")
 
     concurrency = max(1, min(_MAX_CONCURRENCY, concurrency))
 
-    # --- URL validation + dedup (#35 before DNS, #23 case-insensitive, #26 defrag) ---
+    # --- URL validation and deduplication ---
     validated: list[str] = []
     rejected: list[dict] = []
     seen: set[str] = set()
 
     for u in urls:
-        if not isinstance(u, str) or not u.strip():  # #39: safe repr for non-str
-            if len(rejected) < _MAX_REJECTED:  # #34: bound growth
+        if not isinstance(u, str) or not u.strip():
+            if len(rejected) < _MAX_REJECTED:
                 rejected.append({"url": _safe_str(u, max_len=256), "error": "invalid url type or empty"})
             continue
 
         u = u.strip()
-
-        # #26: strip fragment before dedup
         u_defrag, _ = urldefrag(u)
-
-        # #23: case-insensitive dedup key (scheme+host lowercase, path preserved)
         try:
             p = urlparse(u_defrag)
             dedup_key = f"{p.scheme}://{(p.hostname or '').lower()}{p.path}{'?' + p.query if p.query else ''}"
         except ValueError:
             dedup_key = u_defrag.lower()
-
-        # #35: dedup BEFORE DNS validation
         if dedup_key in seen:
-            if len(rejected) < _MAX_REJECTED:  # #11: inform caller
+            if len(rejected) < _MAX_REJECTED:
                 rejected.append({"url": u, "success": False, "content": "", "error": "duplicate URL (skipped)"})
             continue
         seen.add(dedup_key)
 
         url_err = await _validate_url(u_defrag)  # async
         if url_err:
-            if len(rejected) < _MAX_REJECTED:  # #34
+            if len(rejected) < _MAX_REJECTED:
                 rejected.append({"url": u, "error": url_err})
             continue
 
@@ -658,9 +642,9 @@ async def crawl(
 
     async def fetch_one(target_url: str) -> dict:
         try:
-            async with asyncio.timeout(_TIMEOUT_LOCAL + 5):  # #27: per-URL timeout
-                async with local_sem:       # #3: local first
-                    async with _global_sem:  # #3: then global
+            async with asyncio.timeout(_TIMEOUT_LOCAL + 5):
+                async with local_sem:
+                    async with _global_sem:
                         try:
                             client = await _get_client()
                             raw, status_code = await _stream_body(
@@ -668,8 +652,8 @@ async def crawl(
                                 headers={"Authorization": f"Bearer {api_key}"},
                                 json_body={"url": target_url, "extract": extract, "readability": readability},
                             )
-                            client.cookies.clear()  # #24
-                        except httpx.HTTPError as e:  # #12
+                            client.cookies.clear()
+                        except httpx.HTTPError as e:
                             _log_failure("crawl network failed for %s", target_url, exc=e)
                             return {"url": target_url, "success": False, "content": "", "error": _sanitize_exception(e)}
                         except ValueError as e:
@@ -689,32 +673,30 @@ async def crawl(
                             return {"url": target_url, "success": False, "content": "", "error": "unexpected response format", "status_code": status_code_val}
 
                         success = data.get("success") is True
-
-                        # #17: align HTTP status check with browse()
                         if success and status_code_val >= 400:
                             success = False
 
-                        cost = _sanitize_cost(data.get("cost_credits"))  # #14, #58
+                        cost = _sanitize_cost(data.get("cost_credits"))
 
                         if success:
                             raw_content = data.get("content")
-                            content = _safe_str(raw_content, max_len=_MAX_CONTENT_LEN) if raw_content is not None else ""  # #36
+                            content = _safe_str(raw_content, max_len=_MAX_CONTENT_LEN) if raw_content is not None else ""
                         else:
-                            content = ""  # #43: no content leak on failure
+                            content = ""
 
                         return {
-                            "url": target_url,                                      # #30: always original URL
-                            "resolved_url": _validate_resolved_url(data.get("url"), target_url),  # #31, #42
+                            "url": target_url,
+                            "resolved_url": _validate_resolved_url(data.get("url"), target_url),
                             "success": success,
                             "content": content,
-                            "error": _safe_str(data.get("error"), max_len=1024) if data.get("error") is not None else None,  # #58
+                            "error": _safe_str(data.get("error"), max_len=1024) if data.get("error") is not None else None,
                             "cost_credits": cost,
                             "status_code": status_code_val,
                         }
         except TimeoutError:
             return {"url": target_url, "success": False, "content": "", "error": "per-URL timeout exceeded"}
 
-    # --- task execution (#7: asyncio.wait preserves completed on timeout, #40: order) ---
+    # --- task execution ---
     task_pairs: list[tuple[str, asyncio.Task]] = []
     for u in validated:
         t = asyncio.create_task(fetch_one(u))
@@ -729,8 +711,6 @@ async def crawl(
             t.cancel()
     else:
         done, pending = set(), set()
-
-    # #40: collect in input order
     final: list[dict] = []
     for url_str, t in task_pairs:
         if t in done:
@@ -748,17 +728,21 @@ async def crawl(
             rej.setdefault("content", "")
             final.append(rej)
 
-    return json.dumps(final, ensure_ascii=False, indent=2, allow_nan=False)
+    has_success = any(item.get("success") is True for item in final)
+    return _tool_text(
+        json.dumps(final, ensure_ascii=False, indent=2, allow_nan=False),
+        is_error=not has_success,
+    )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def scrape(
     url: str,
     formats: list[str] | None = None,
     readability: bool = True,
     wait_selector: str | None = None,
     wait_timeout_ms: int = 10000,
-) -> str:
+):
     """
     Retrieve one URL and return the requested content format.
 
@@ -802,13 +786,13 @@ async def scrape(
     return err or _format_api_response(data, status_code=status_code)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def fetch(
     url: str,
     wait_selector: str | None = None,
     wait_timeout_ms: int = 10000,
     session_id: str | None = None,
-) -> str:
+):
     """
     Retrieve raw page data for one URL.
 
@@ -848,13 +832,13 @@ async def fetch(
     return err or _format_api_response(data, status_code=status_code)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def extract(
     url: str,
     json_schema: dict | None = None,
     prompt: str | None = None,
     readability: bool = True,
-) -> str:
+):
     """
     Retrieve one URL and return structured JSON data.
 
@@ -895,13 +879,13 @@ async def extract(
     return err or _format_api_response(data, status_code=status_code)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def batch_scrape(
     urls: list[str],
     formats: list[str] | None = None,
     readability: bool = True,
     concurrency: int = 3,
-) -> str:
+):
     """
     Retrieve multiple URLs in one request.
 
@@ -957,7 +941,7 @@ async def batch_scrape(
     return err or _format_api_response(data, status_code=status_code)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def watch_snapshot(
     url: str,
     extract: str = "markdown",
@@ -965,7 +949,7 @@ async def watch_snapshot(
     ttl_days: int = 7,
     json_schema: dict | None = None,
     prompt: str | None = None,
-) -> str:
+):
     """
     Save a snapshot for one URL and return snapshot metadata.
 
@@ -1014,14 +998,14 @@ async def watch_snapshot(
     return err or _format_api_response(data, status_code=status_code)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def watch_diff(
     url: str,
     extract: str = "markdown",
     readability: bool = True,
     json_schema: dict | None = None,
     prompt: str | None = None,
-) -> str:
+):
     """
     Compare the current URL snapshot with the previous saved snapshot.
 
@@ -1065,8 +1049,8 @@ async def watch_diff(
     return err or _format_api_response(data, status_code=status_code)
 
 
-@mcp.tool()
-async def watch_list() -> str:
+@mcp.tool(structured_output=False)
+async def watch_list():
     """
     List saved watch targets for the configured API key.
     """
@@ -1082,8 +1066,8 @@ async def watch_list() -> str:
     return err or _format_api_response(data, status_code=status_code)
 
 
-@mcp.tool()
-async def credits() -> str:
+@mcp.tool(structured_output=False)
+async def credits():
     """
     Return account credit and tier information for the configured API key.
     """
@@ -1099,8 +1083,8 @@ async def credits() -> str:
     return err or _format_api_response(data, status_code=status_code)
 
 
-@mcp.tool()
-async def pricing() -> str:
+@mcp.tool(structured_output=False)
+async def pricing():
     """
     Return public pricing information.
     """

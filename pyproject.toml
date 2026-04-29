@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "karon-mcp"
-version = "1.4.1"
+version = "1.4.2"
 description = "Karon API MCP server for Claude, Cursor, and other MCP clients. Retrieve web content from MCP-compatible tools."
 readme = "PYPI_README.md"
 license = "MIT"
@@ -34,7 +34,6 @@ dependencies = [
 Homepage = "https://karonlabs.net/api/"
 Documentation = "https://karonlabs.net/api/docs.html"
 Repository = "https://github.com/pplar39/karon-mcp"
-Changelog = "https://github.com/pplar39/karon-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
 karon-mcp = "karon_mcp.__main__:main"
@@ -43,13 +42,13 @@ karon-mcp = "karon_mcp.__main__:main"
 packages = ["src/karon_mcp"]
 
 [tool.hatch.build.targets.sdist]
-include = [
-    "/src/karon_mcp",
-    "/README.md",
-    "/PYPI_README.md",
-    "/CHANGELOG.md",
-    "/LICENSE",
-    "/pyproject.toml",
+only-include = [
+    "src/karon_mcp",
+    "README.md",
+    "PYPI_README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
 ]
 exclude = [
     "/.git",

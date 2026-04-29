@@ -2,7 +2,7 @@
 
 MCP server for the Karon API.
 
-Karon MCP 1.4.1 is the supported public release. Earlier public artifacts are superseded.
+Karon MCP 1.4.2 is the supported public release. Earlier public artifacts are superseded.
 
 ## Install
 

@@ -2,7 +2,7 @@
 
 MCP server for the [Karon API](https://karonlabs.net/api/). Retrieve web content directly from Claude, Cursor, VS Code, or any MCP-compatible client.
 
-Karon MCP 1.4.1 is the supported public release.
+Karon MCP 1.4.2 is the supported public release.
 
 ## Features
 
@@ -178,31 +178,10 @@ If you installed with pip:
 pip install --upgrade karon-mcp
 ```
 
-## Development
-
-### Running Tests
-
-```bash
-# Setup
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-
-# Run local tests
-pytest tests/ -v
-```
-
-Tests cover:
-- MCP protocol handshake (`initialize`)
-- Tool discovery (`tools/list`)
-- Tool schemas and local error handling
-- Error handling (invalid URL, missing API key)
-
 ## Links
 
 - [API Documentation](https://karonlabs.net/api/docs.html)
 - [Pricing](https://karonlabs.net/api/pricing.html)
-- [Changelog](CHANGELOG.md)
 
 ## License
 
