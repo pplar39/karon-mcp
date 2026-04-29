@@ -681,15 +681,19 @@ async def crawl(
                         if success:
                             raw_content = data.get("content")
                             content = _safe_str(raw_content, max_len=_MAX_CONTENT_LEN) if raw_content is not None else ""
+                            error = None
                         else:
                             content = ""
+                            upstream_error = _safe_str(data.get("error", "unknown"), max_len=512)
+                            _log_upstream_error("crawl", upstream_error, status_code_val)
+                            error = _api_error_message(data, status_code_val)
 
                         return {
                             "url": target_url,
                             "resolved_url": _validate_resolved_url(data.get("url"), target_url),
                             "success": success,
                             "content": content,
-                            "error": _safe_str(data.get("error"), max_len=1024) if data.get("error") is not None else None,
+                            "error": error,
                             "cost_credits": cost,
                             "status_code": status_code_val,
                         }

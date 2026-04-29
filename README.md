@@ -2,7 +2,7 @@
 
 MCP server for the [Karon API](https://karonlabs.net/api/). Retrieve web content directly from Claude, Cursor, VS Code, or any MCP-compatible client.
 
-Karon MCP 1.4.2 is the supported public release.
+Karon MCP 1.4.3 is the supported public release.
 
 ## Features
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "karon-mcp"
-version = "1.4.2"
+version = "1.4.3"
 description = "Karon API MCP server for Claude, Cursor, and other MCP clients. Retrieve web content from MCP-compatible tools."
 readme = "PYPI_README.md"
 license = "MIT"
