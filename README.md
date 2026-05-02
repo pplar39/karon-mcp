@@ -17,7 +17,7 @@ Karon MCP 1.4.3 is the supported public release.
 
 ### 1. Get your API key
 
-Sign up at [karonlabs.net/api/signup.html](https://karonlabs.net/api/signup.html). See [pricing](https://karonlabs.net/api/pricing.html) for current free tier and paid tier details.
+Sign up at [karonlabs.net/api/signup.html](https://karonlabs.net/api/signup.html). 
 
 ### 2. Install
 
